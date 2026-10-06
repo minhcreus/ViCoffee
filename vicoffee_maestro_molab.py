@@ -26,7 +26,7 @@ def _():
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
-    # MAESTRO on ViCoffee · v1.0
+    # MAESTRO on ViCoffee · v1.1
 
     Masked-autoencoder pretraining (MAESTRO, Labatie et al. 2025, arXiv 2508.10894) on ViCoffee-S2 Sentinel-2 time series,
     ported from *MAESTRO on PASTIS v3.4*: ViT-tiny, 16×16 crops, patch 2, 16 temporal bins, LP / FT / SL with LP-FT, layer decay and EMA.
@@ -36,13 +36,22 @@ def _(mo):
     The encoder is pretrained once on the 120 unlabelled windows, which lie outside all 10 labelled sites, so one encoder serves every fold without test leakage.
 
     Run ① → ② → ③. molab keeps only files uploaded through the file browser, so download the session bundle (last section) before the session ends.
+
+    **Changes in v1.1 (6 Oct 2026)**
+
+    - `HF_DATASET_REPO` is preset to `Gr8-FPT-Capstone/ViCoffeeS2v1.1`. Only the token is left to enter.
+    - ① reads the data straight from the zip in the dataset: it downloads the zip once and pulls the three files out of it. The extra paste-in cell is no longer needed.
+    - ① also finds the three files if you drag them into molab's file browser, and then skips the download.
+    - If the download fails, ① says why: the token was rejected, or it can't see the dataset (with the dataset names it can see).
+    - A rejected token now says to create a new one and copy it from the pop-up, since Hugging Face shows it in full only once.
+    - No backup to a second Hugging Face repo: results stay in the session bundle you download by hand.
     """)
     return
 
 
 @app.cell
 def _():
-    VERSION = "1.0"
+    VERSION = "1.1"
     import time
     SESSION_T0 = time.time()
 
@@ -118,7 +127,7 @@ def _(mo):
 @app.cell
 def _(WORK):
     # --- data: private dataset in your Hugging Face organization ----------------------------
-    HF_DATASET_REPO = "YOUR-ORG/YOUR-DATASET"   # the part after huggingface.co/datasets/
+    HF_DATASET_REPO = "Gr8-FPT-Capstone/ViCoffeeS2v1.1"   # the part after huggingface.co/datasets/
     HF_REVISION = None                          # branch, tag or commit; None = main
     DATA_FILE_NAMES = ("s2_10m_2023_2025.h5", "labels_10m.h5", "splits.json")
 
@@ -833,6 +842,7 @@ def _(
     HF_REVISION,
     OUT,
     PATCH,
+    Path,
     STATE,
     WORK,
     YEARS,
@@ -844,17 +854,23 @@ def _(
     os,
     run_cache,
     ui_hf_token,
+    zipfile,
 ):
     DATA_DIR = WORK / "data"
     HF_TOKEN = ui_hf_token.value.strip() or os.environ.get("HF_TOKEN") or None
 
 
     def find_data_files():
+        # the HF download lands in DATA_DIR; files uploaded through molab's file browser sit next to the notebook
+        _roots = [DATA_DIR] + [r for r in {Path(mo.notebook_dir() or Path.cwd()), Path.cwd()} if r.exists()]
         found = {}
         for _n in DATA_FILE_NAMES:
-            _hits = sorted(DATA_DIR.rglob(_n), key=lambda p: len(p.parts)) if DATA_DIR.exists() else []
-            if _hits:
-                found[_n] = _hits[0]
+            for _root in _roots:
+                _hits = sorted((h for h in _root.rglob(_n) if WORK not in h.parents or _root == DATA_DIR),
+                               key=lambda p: len(p.parts)) if _root.exists() else []
+                if _hits:
+                    found[_n] = _hits[0]
+                    break
         return found
 
 
@@ -865,9 +881,44 @@ def _(
                 mo.md("**Set `HF_DATASET_REPO` in Settings first.**"))
         mo.stop(HF_TOKEN is None, mo.md("**No token: add the `HF_TOKEN` secret or paste a token above.**"))
         from huggingface_hub import snapshot_download
-        with mo.status.spinner(title=f"downloading {HF_DATASET_REPO}"):
-            snapshot_download(HF_DATASET_REPO, repo_type="dataset", revision=HF_REVISION, token=HF_TOKEN,
-                              local_dir=DATA_DIR, allow_patterns=[f"*{_n}" for _n in DATA_FILE_NAMES])
+        from huggingface_hub import HfApi as _HfApi
+        from huggingface_hub.errors import HfHubHTTPError as _HfHubHTTPError
+        try:
+            with mo.status.spinner(title=f"downloading {HF_DATASET_REPO}"):
+                snapshot_download(HF_DATASET_REPO, repo_type="dataset", revision=HF_REVISION, token=HF_TOKEN,
+                                  local_dir=DATA_DIR, allow_patterns=[f"*{_n}" for _n in DATA_FILE_NAMES] + ["*.zip"])
+        except _HfHubHTTPError as _err:
+            _api = _HfApi(token=HF_TOKEN)
+            try:
+                _who = _api.whoami()["name"]
+            except Exception:
+                _who = None
+            if _who is None:
+                _why = ("**The token was rejected** (it is wrong, expired or cut short). Hugging Face shows a token in full only once, so create a new one "
+                        "at huggingface.co/settings/tokens (or use *Invalidate and refresh* on the old one), copy it from the pop-up and paste it above. "
+                        "If you saved it as a secret, replace the secret too and restart the notebook.")
+            else:
+                _org = HF_DATASET_REPO.split("/")[0]
+                try:
+                    _seen = [d.id for d in _api.list_datasets(author=_org)]
+                except Exception:
+                    _seen = []
+                _why = (f"**Token OK (user `{_who}`), but `{HF_DATASET_REPO}` is not visible to it.** "
+                        + (f"Datasets this token sees in `{_org}`: " + ", ".join(f"`{d}`" for d in _seen) + ". Copy the exact id into `HF_DATASET_REPO`."
+                           if _seen else f"It sees no datasets in `{_org}`: give the token read access to that organization, or use a Read-type token."))
+            mo.stop(True, mo.md(_why + f"\n\n`{type(_err).__name__}`: {str(_err).splitlines()[0]}"))
+    # the dataset may hold the files inside a zip (as on the PC): pull them out, wherever they sit in it
+    if len(find_data_files()) < len(DATA_FILE_NAMES):
+        import shutil as _shutil
+        for _zp in sorted(DATA_DIR.rglob("*.zip")):
+            with zipfile.ZipFile(_zp) as _zz:
+                for _m in _zz.infolist():
+                    _name = _m.filename.replace("\\", "/").rstrip("/").split("/")[-1]
+                    if _name in DATA_FILE_NAMES and _name not in find_data_files():
+                        with mo.status.spinner(title=f"extracting {_name} from {_zp.name}"):
+                            with _zz.open(_m) as _src, open(DATA_DIR / _name, "wb") as _dst:
+                                _shutil.copyfileobj(_src, _dst, 16 * 2**20)
+            _zp.unlink()
     DATA_FILES = find_data_files()
     _missing = [n for n in DATA_FILE_NAMES if n not in DATA_FILES]
     if _missing:
