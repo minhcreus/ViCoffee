@@ -35,6 +35,7 @@ def _(mo):
 
     **Changes**
 
+    - 14 Oct: setups K to N (32 dates per year, 1600-epoch pretraining, tuning on val, Small encoder); faster GPU pretraining that resumes after a restart.
     - 12 Oct: setups F to J (test-time augmentation, spatial head, 400-epoch pretraining, self-training, Small encoder).
     - 12 Oct: pretraining on labelled-site images removed; E is the default.
     - 10 Oct: setup picker A to E (overlapping tiles, flips, drop path, Lovász loss) and the Ladder table.
@@ -133,14 +134,14 @@ def _(WORK):
     EPOCHS = dict(LP=100, FT=100, SL=100)
     MODEL = "tiny"
     CROP, PATCH, BINS = 16, 2, 16
-    PRE = dict(epochs=150, bs=72, lr=3e-5, mask=0.75, p_space=0.25, p_time=0.25, p_block=0.5, block_frac=(0.25, 0.5), final_div=1e4)
+    PRE = dict(epochs=150, bs=72, lr=3e-5, mask=0.75, p_space=0.25, p_time=0.25, p_block=0.5, block_frac=(0.25, 0.5), final_div=1e4, save_every=50)
     DN = dict(bs=48, lr=dict(LP=1e-5, FT=2e-5, SL=4e-5), final_div=dict(LP=1e4, FT=2.0, SL=2.0), layer_decay=0.75, lpft=True, ema=True,
               val_every=5, patience_frac=0.3, min_frac=0.5, min_delta=0.002)
     WD, WARM_FRAC = 0.01, 0.2
 
     # setups: each adds one change to the one above (A = v1.1)
     _A = dict(eval_stride=16, flips=False, drop_path=0.0, lovasz=0.0, tta=False, spatial=False, pre_epochs=PRE["epochs"],
-              self_train=False, model=MODEL)
+              self_train=False, model=MODEL, bins=BINS, tune=False, fast_pre=False)
     _B = dict(_A, eval_stride=8)
     _C = dict(_B, flips=True)
     _D = dict(_C, drop_path=0.1)
@@ -150,13 +151,21 @@ def _(WORK):
     _H = dict(_G, pre_epochs=400)
     _I = dict(_H, self_train=True)
     _J = dict(_I, model="small")
+    _K = dict(_I, bins=32, fast_pre=True)  # K to N build on I
+    _L = dict(_K, pre_epochs=1600)
+    _M = dict(_L, tune=True)
+    _N = dict(_M, model="small")
     SETUPS = {"A_v1.1": _A, "B_overlap": _B, "C_flips": _C, "D_droppath": _D, "E_lovasz": _E,
-              "F_tta": _F, "G_spatial": _G, "H_pre400": _H, "I_selftrain": _I, "J_small": _J}
+              "F_tta": _F, "G_spatial": _G, "H_pre400": _H, "I_selftrain": _I, "J_small": _J,
+              "K_bins32": _K, "L_pre1600": _L, "M_tune": _M, "N_small": _N}
     ST_CONF, TTA_DRAWS = 0.9, 4  # pseudo-label confidence, test-time date draws
+    TUNE = dict(FT=[dict(ld=ld, lr=m) for ld in (0.75, 0.9) for m in (1, 2)], SL=[dict(lr=m) for m in (0.5, 1, 2)])  # picked on val
     SETUP_LABELS = {"A_v1.1": "A · v1.1 settings", "B_overlap": "B · + overlapping tiles", "C_flips": "C · + flips and rotations",
                     "D_droppath": "D · + drop path", "E_lovasz": "E · + Lovász loss (all quick wins)",
                     "F_tta": "F · + test-time augmentation", "G_spatial": "G · + spatial refinement head",
-                    "H_pre400": "H · + 400-epoch pretraining", "I_selftrain": "I · + self-training (FT)", "J_small": "J · + Small encoder"}
+                    "H_pre400": "H · + 400-epoch pretraining", "I_selftrain": "I · + self-training (FT)", "J_small": "J · + Small encoder",
+                    "K_bins32": "K · I + 32 dates per year", "L_pre1600": "L · + 1600-epoch pretraining",
+                    "M_tune": "M · + tuning on val", "N_small": "N · + Small encoder"}
     return (
         BASE,
         BINS,
@@ -176,6 +185,7 @@ def _(WORK):
         SETUP_LABELS,
         ST_CONF,
         TTA_DRAWS,
+        TUNE,
         WARM_FRAC,
         WD,
     )
@@ -217,7 +227,7 @@ def _(BASE, SETUPS, mo, ui_setup):
     mo.md(f"**Setup {S['name']}** · tiles every {S['eval_stride']} px · flips {'on' if S['flips'] else 'off'} · "
           f"drop path {S['drop_path']} · Lovász weight {S['lovasz']} · TTA {'on' if S['tta'] else 'off'} · "
           f"spatial head {'on' if S['spatial'] else 'off'} · self-training {'on' if S['self_train'] else 'off'} · "
-          f"encoder {S['model']}, {S['pre_epochs']} epochs")
+          f"{S['bins']} dates per year · tuning {'on' if S['tune'] else 'off'} · encoder {S['model']}, {S['pre_epochs']} epochs")
     return OUT, S
 
 
@@ -250,6 +260,7 @@ def _(
     SAVE_WEIGHTS,
     ST_CONF,
     TTA_DRAWS,
+    TUNE,
     USE_SCALER,
     WARM_FRAC,
     WD,
@@ -273,9 +284,9 @@ def _(
     STATE = {}  # norm stats and eval crops, filled by ①
 
 
-    def make_bins(T):
-        parts = np.array_split(np.arange(T), BINS)
-        idx = np.full((BINS, max(len(p) for p in parts)), -1)
+    def make_bins(T, nb=BINS):
+        parts = np.array_split(np.arange(T), nb)
+        idx = np.full((nb, max(len(p) for p in parts)), -1)
         for i, p in enumerate(parts):
             idx[i, :len(p)] = p
         return idx
@@ -292,7 +303,13 @@ def _(
         data = {p: dict(X=f[f"labeled/{p}/X"][:], clear=np.isin(f[f"labeled/{p}/SCL"][:], CLEAR_SCL),
                         label=L[p]["label"][:], block=L[p]["block"][:]) for p in sites}
         splits = json.loads(Path(files["splits.json"]).read_text())
-        return dict(f=f, sites=sites, doy=doy, tidx=tidx, bins={y: make_bins(len(t)) for y, t in tidx.items()}, data=data, splits=splits)
+        return dict(f=f, sites=sites, doy=doy, tidx=tidx, bins={y: make_bins(len(t)) for y, t in tidx.items()}, nb=BINS, data=data, splits=splits)
+
+
+    def use_bins(D, nb):
+        if D["nb"] != nb:
+            D["bins"], D["nb"] = {y: make_bins(len(t), nb) for y, t in D["tidx"].items()}, nb
+        D_REF.update(tidx=D["tidx"], bins=D["bins"], doy=D["doy"])
 
 
     def load_unlabeled(D):
@@ -353,12 +370,15 @@ def _(
         return normalize(X[t, :, r:r + CROP, c:c + CROP], cl), cl, t
 
 
+    def dev(a):
+        return a if torch.is_tensor(a) else torch.from_numpy(np.ascontiguousarray(a)).to(DEVICE)
+
+
     def to_inputs(x, cl, doy):
-        x = torch.from_numpy(np.ascontiguousarray(x)).to(DEVICE).float()
-        cl = torch.from_numpy(np.ascontiguousarray(cl)).to(DEVICE)
+        x, cl = dev(x).float(), dev(cl)
         B, T, g = cl.shape[0], cl.shape[1], CROP // PATCH
         tok = cl.reshape(B, T, g, PATCH, g, PATCH)
-        d = torch.from_numpy(np.asarray(doy, "f4")).to(DEVICE)
+        d = dev(np.asarray(doy, "f4") if not torch.is_tensor(doy) else doy).float()
         tf = temporal_features(d, d - 1)
         if not MASK_CLOUDY_TOKENS:
             return x, tf, None, None
@@ -614,19 +634,53 @@ def _(
         sch.step()
 
 
-    def ckpt_path(fold, epochs=None, model=None):
+    def ckpt_path(fold, epochs=None, model=None, bins=BINS):
         tag = "unl"  # unlabelled windows only
         m = "_cm" if MASK_CLOUDY_TOKENS else ""
         P_ = dict(PRE, epochs=epochs or PRE["epochs"])
-        return BASE / "pretrain" / (f"mae_{tag}_{model or MODEL}_D{BINS}_c{CROP}p{PATCH}_m{int(P_['mask'] * 100)}_s{int(P_['p_space'] * 100)}"
+        return BASE / "pretrain" / (f"mae_{tag}_{model or MODEL}_D{bins}_c{CROP}p{PATCH}_m{int(P_['mask'] * 100)}_s{int(P_['p_space'] * 100)}"
                                    f"_t{int(P_['p_time'] * 100)}_b{int(P_['p_block'] * 100)}_e{P_['epochs']}_bs{P_['bs']}{m}.pt")
 
 
-    def pretrain(D, fold, epochs=None, model=None):
+    def gpu_sampler(D, U):
+        """Unlabelled windows on the GPU, same date picking as sample_crop."""
+        q05, q95, med, rg = (torch.tensor(STATE["ST"][k].ravel(), device=DEVICE)[:, None, None] for k in ("q05", "q95", "median", "range"))
+        C = torch.from_numpy(U["clear"]).to(DEVICE)
+        X = torch.empty(U["X"].shape, dtype=torch.float16, device=DEVICE)
+        for k in range(len(X)):
+            X[k] = ((torch.from_numpy(U["X"][k].astype("f4")).to(DEVICE).clamp(q05, q95) - med) / rg * C[k][:, None]).half()
+        L = max(b.shape[1] for b in D["bins"].values())
+        TB = torch.full((len(YEARS), D["nb"], L), -1, dtype=torch.long)
+        for yi, y in enumerate(YEARS):
+            b = D["bins"][y]
+            TB[yi, :, :b.shape[1]] = torch.from_numpy(np.where(b >= 0, D["tidx"][y][np.maximum(b, 0)], -1))
+        TB, DOY, ar, bands = TB.to(DEVICE), torch.from_numpy(D["doy"]).to(DEVICE), torch.arange(CROP, device=DEVICE), torch.arange(N_BANDS, device=DEVICE)
+        H, W = X.shape[-2:]
+
+        def batch(ids, gen):
+            ids = torch.as_tensor(ids, device=DEVICE)
+            k, B = ids // len(YEARS), len(ids)
+            r = torch.randint(0, H - CROP + 1, (B,), device=DEVICE, generator=gen)[:, None] + ar
+            c = torch.randint(0, W - CROP + 1, (B,), device=DEVICE, generator=gen)[:, None] + ar
+            tb = TB[ids % len(YEARS)]
+            ok, t = tb >= 0, tb.clamp(min=0)
+            cnt = C[k[:, None, None, None, None], t[..., None, None], r[:, None, None, :, None], c[:, None, None, None, :]].sum((-1, -2))
+            cand = ok & (cnt > 0)
+            cand = torch.where(cand.any(-1, keepdim=True), cand, ok)
+            ts = t.gather(2, (torch.rand(cand.shape, device=DEVICE, generator=gen) * cand).argmax(-1, keepdim=True)).squeeze(-1)
+            x = X[k[:, None, None, None, None], ts[..., None, None, None], bands[None, None, :, None, None], r[:, None, None, :, None], c[:, None, None, None, :]]
+            cl = C[k[:, None, None, None], ts[..., None, None], r[:, None, :, None], c[:, None, None, :]]
+            return x, cl, DOY[ts]
+        return batch
+
+
+    def pretrain(D, fold, epochs=None, model=None, bins=BINS, fast=False):
+        use_bins(D, bins)
         P_, model = dict(PRE, epochs=epochs or PRE["epochs"]), model or MODEL
-        path = ckpt_path(fold, P_["epochs"], model)
+        path = ckpt_path(fold, P_["epochs"], model, bins)
         if path.exists():
             return path
+        part = path.with_suffix(".part.pt")  # saved every few epochs, so a new session resumes
         U = load_unlabeled(D)
         imgs = [(U["X"][k], U["clear"][k], y) for k in range(len(U["X"])) for y in YEARS]
         rows = np.concatenate([np.full(max(1, X.shape[-2] * X.shape[-1] // CROP ** 2), i) for i, (X, _, _) in enumerate(imgs)])
@@ -638,32 +692,56 @@ def _(
         spe = -(-len(rows) // bs)
         sch = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda(spe * P_["epochs"], WARM_FRAC, P_["final_div"]))
         scaler = torch.amp.GradScaler(enabled=USE_SCALER)
-        S, hist, t0 = (CROP // PATCH) ** 2, [], time.time()
-        print(f"pretraining: {len(imgs)} image-years, {len(rows)} crops/epoch, {spe} steps/epoch, {P_['epochs']} epochs")
-        for ep in range(P_["epochs"]):
+        S, hist, t0, ep0 = (CROP // PATCH) ** 2, [], time.time(), 0
+        gen = torch.Generator(device=DEVICE).manual_seed(0)
+        sampler = gpu_sampler(D, U) if fast else None
+        if part.exists():
+            ck = torch.load(part, map_location=DEVICE, weights_only=False)
+            for o, k in ((mae, "mae"), (opt, "opt"), (sch, "sch"), (scaler, "scaler")):
+                o.load_state_dict(ck[k])
+            hist, ep0 = ck["hist"], ck["ep"]
+            rng.bit_generator.state = ck["rng"]
+            torch.set_rng_state(ck["torch_rng"].cpu())
+            gen.set_state(ck["gen"].cpu())
+            if DEVICE == "cuda":
+                torch.cuda.set_rng_state(ck["cuda_rng"].cpu())
+            print(f"resuming pretraining at epoch {ep0}")
+        print(f"pretraining: {len(imgs)} image-years, {len(rows)} crops/epoch, {spe} steps/epoch, {P_['epochs']} epochs, {bins} dates"
+              + (", GPU sampler" if fast else ""))
+        for ep in range(ep0, P_["epochs"]):
             mae.train()
             er, tot = rng.permutation(rows), torch.zeros((), device=DEVICE)
             for a in range(0, len(er), bs):
-                xs, cls, ds = [], [], []
-                for i in er[a:a + bs]:
-                    X, clear, y = imgs[i]
-                    r, c = rng.integers(0, X.shape[-2] - CROP + 1), rng.integers(0, X.shape[-1] - CROP + 1)
-                    x, cl, t = sample_crop(X, clear, D["tidx"][y], D["bins"][y], r, c, rng)
-                    xs.append(x)
-                    cls.append(cl)
-                    ds.append(D["doy"][t])
-                x, tf, kpm, full = to_inputs(np.stack(xs), np.stack(cls), np.stack(ds))
-                masked, keep = build_mask(x.shape[0], BINS, S, P_["mask"], P_["p_space"], P_["p_time"], P_["p_block"], P_["block_frac"], DEVICE)
+                if fast:
+                    x, cl, d = sampler(er[a:a + bs], gen)
+                    x, tf, kpm, full = to_inputs(x, cl, d)
+                else:
+                    xs, cls, ds = [], [], []
+                    for i in er[a:a + bs]:
+                        X, clear, y = imgs[i]
+                        r, c = rng.integers(0, X.shape[-2] - CROP + 1), rng.integers(0, X.shape[-1] - CROP + 1)
+                        x, cl, t = sample_crop(X, clear, D["tidx"][y], D["bins"][y], r, c, rng)
+                        xs.append(x)
+                        cls.append(cl)
+                        ds.append(D["doy"][t])
+                    x, tf, kpm, full = to_inputs(np.stack(xs), np.stack(cls), np.stack(ds))
+                masked, keep = build_mask(x.shape[0], bins, S, P_["mask"], P_["p_space"], P_["p_time"], P_["p_block"], P_["block_frac"], DEVICE)
                 with torch.autocast(DEVICE, dtype=AMP_DTYPE, enabled=AMP_ON):
                     loss = mae.loss(x, tf, masked, keep, kpm, full)
                 step(opt, sch, scaler, loss)
                 tot += loss.detach()
             hist.append(float(tot) / spe)
             print(f"  pretrain epoch {ep + 1:3d}/{P_['epochs']}  masked L1 {hist[-1]:.4f}  {(time.time() - t0) / 60:.1f} min")
+            if (ep + 1) % P_["save_every"] == 0 and ep + 1 < P_["epochs"]:
+                part.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(dict(mae=mae.state_dict(), opt=opt.state_dict(), sch=sch.state_dict(), scaler=scaler.state_dict(), hist=hist, ep=ep + 1,
+                                rng=rng.bit_generator.state, torch_rng=torch.get_rng_state(), gen=gen.get_state(),
+                                cuda_rng=torch.cuda.get_rng_state() if DEVICE == "cuda" else None), part)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({"encoder": mae.encoder.state_dict(), "model": model, "fold": fold, "history": hist, "epoch": P_["epochs"], "bins": BINS,
+        torch.save({"encoder": mae.encoder.state_dict(), "model": model, "fold": fold, "history": hist, "epoch": P_["epochs"], "bins": bins,
                     "crop": CROP, "patch": PATCH, "pre": P_, "with_train_sites": False, "norm_stats": {k: v.ravel().tolist() for k, v in STATE["ST"].items()},
                     "secs": time.time() - t0}, path)
+        part.unlink(missing_ok=True)
         return path
 
 
@@ -720,9 +798,10 @@ def _(
 
 
     def eval_crops(D, stride):
-        if stride not in STATE["EV"]:
-            STATE["EV"][stride] = eval_cache(D, stride)
-        return STATE["EV"][stride]
+        key = (stride, D["nb"])
+        if key not in STATE["EV"]:
+            STATE["EV"][key] = eval_cache(D, stride)
+        return STATE["EV"][key]
 
 
     VIEWS = [(k, f) for k in range(4) for f in (False, True)]  # rotations x flip
@@ -738,7 +817,7 @@ def _(
 
 
     @torch.no_grad()
-    def predict_crops(model, x, cl, doy, chunk=64, tta=False):
+    def predict_crops(model, x, cl, doy, chunk=512 if DEVICE == "cuda" else 64, tta=False):
         out = 0.0
         views = VIEWS if tta else [(0, False)]
         for k, f in views:
@@ -871,7 +950,8 @@ def _(
         return Segmenter(enc, N_CLASSES, freeze=mode == "LP", spatial=S["spatial"]).to(DEVICE)
 
 
-    def train_run(D, mode, fold, ratio, seed, enc_path, S, pseudo=None):
+    def train_run(D, mode, fold, ratio, seed, enc_path, S, pseudo=None, hp=None):
+        hp = hp or {}
         torch.manual_seed(seed)
         rng = np.random.default_rng(10000 + seed)
         units, labels = train_units(D, fold, ratio, seed)
@@ -882,7 +962,7 @@ def _(
         if lpft:
             model.load_state_dict(torch.load(head_file, map_location="cpu"), strict=False)
         n_ep, bs = EPOCHS[mode], min(DN["bs"], len(units))
-        groups = param_groups(model, DN["lr"][mode] * bs ** 0.5, DN["layer_decay"] if mode == "FT" else 1.0)
+        groups = param_groups(model, DN["lr"][mode] * hp.get("lr", 1) * bs ** 0.5, hp.get("ld", DN["layer_decay"]) if mode == "FT" else 1.0)
         opt = torch.optim.AdamW(groups, betas=(0.9, 0.99), weight_decay=WD, fused=FUSED)
         spe = -(-len(units) // bs)
         sch = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda(spe * n_ep, WARM_FRAC, DN["final_div"][mode]))
@@ -942,24 +1022,39 @@ def _(
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"model": {k: v.detach().cpu() for k, v in model.state_dict().items()}, "regime": mode, "fold": fold, "ratio": ratio, "seed": seed,
-                    "encoder_size": S["model"], "spatial": S["spatial"], "n_classes": N_CLASSES, "bins": BINS, "crop": CROP, "patch": PATCH, "val_mIoU": info["val_mIoU"],
+                    "encoder_size": S["model"], "spatial": S["spatial"], "n_classes": N_CLASSES, "bins": S["bins"], "crop": CROP, "patch": PATCH, "val_mIoU": info["val_mIoU"],
                     "test": {k: v for k, v in test.items() if k != "confusion"}}, path)
 
 
+    def fit(D, mode, fold, ratio, seed, enc_path, S):
+        """With tuning on, try each TUNE setting and keep the best on val."""
+        grid = TUNE.get(mode, [{}]) if S["tune"] else [{}]
+        best, vals = None, []
+        for hp in grid:
+            m, info = train_run(D, mode, fold, ratio, seed, enc_path, S, hp=hp)
+            vals.append(round(info["val_mIoU"], 5))
+            if best is None or info["val_mIoU"] > best[1]["val_mIoU"]:
+                best = (m, dict(info, hp=hp))
+        if len(grid) > 1:
+            best[1]["tune_val"] = vals
+        return best
+
+
     def run_one(D, mode, fold, ratio, seed, enc_path, S):
+        use_bins(D, S["bins"])
         path = S["out"] / "runs" / f"{mode}_f{fold}_r{ratio}_s{seed}.json"
         if path.exists():
             return json.loads(path.read_text())
         t0 = time.time()
-        model, info = train_run(D, mode, fold, ratio, seed, enc_path, S)
+        model, info = fit(D, mode, fold, ratio, seed, enc_path, S)
         test_sites = D["splits"]["folds"][fold]["test"]
         extra = {}
         if mode == "FT" and S["self_train"]:
             extra["test_mIoU_teacher"] = evaluate(model, D, test_sites, S["eval_stride"], S["tta"])["mIoU"]
             P = pseudo_labels(model, D, S)
-            teacher = {k: info[k] for k in ("epochs_run", "best_epoch", "val_mIoU")}
-            model, info = train_run(D, mode, fold, ratio, seed, enc_path, S, pseudo=P)
-            info = dict(info, teacher=teacher, pseudo_kept=round(P["kept"], 4), pseudo_coffee=round(P["coffee"], 4))
+            teacher = {k: info[k] for k in ("epochs_run", "best_epoch", "val_mIoU", "hp", "tune_val") if k in info}
+            model, info = train_run(D, mode, fold, ratio, seed, enc_path, S, pseudo=P, hp=info.get("hp"))
+            info = dict(info, hp=teacher.get("hp"), teacher=teacher, pseudo_kept=round(P["kept"], 4), pseudo_coffee=round(P["coffee"], 4))
         test = evaluate(model, D, test_sites, S["eval_stride"], S["tta"])
         no_overlap = test["mIoU"] if S["eval_stride"] == CROP else evaluate(model, D, test_sites, CROP)["mIoU"]
         if S["tta"]:
@@ -1307,13 +1402,13 @@ def _(
     torch,
 ):
     _need_enc = any(m in REGIMES for m in ("LP", "FT"))
-    _ready = (not _need_enc) or bool(PRETRAINED_ENCODER) or all(ckpt_path(f, S["pre_epochs"], S["model"]).exists() for f in FOLDS)
+    _ready = (not _need_enc) or bool(PRETRAINED_ENCODER) or all(ckpt_path(f, S["pre_epochs"], S["model"], S["bins"]).exists() for f in FOLDS)
     _ = restore_notes
     mo.stop(not run_pre.value and not _ready, mo.md("*Press ② to pretrain.*"))
     ENC_PATHS, HISTORIES = {}, {}
     if _need_enc:
         for _f in FOLDS:
-            ENC_PATHS[_f] = Path(PRETRAINED_ENCODER) if PRETRAINED_ENCODER else pretrain(D, _f, S["pre_epochs"], S["model"])
+            ENC_PATHS[_f] = Path(PRETRAINED_ENCODER) if PRETRAINED_ENCODER else pretrain(D, _f, S["pre_epochs"], S["model"], S["bins"], S["fast_pre"])
             _st = torch.load(ENC_PATHS[_f], map_location="cpu", weights_only=False)
             HISTORIES[ENC_PATHS[_f].name] = _st.get("history", [])
     mo.md("\n".join(f"- fold {f}: `{p.name}`" for f, p in ENC_PATHS.items()) or "*SL only: no encoder needed.*")
