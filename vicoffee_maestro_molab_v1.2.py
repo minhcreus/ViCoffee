@@ -35,6 +35,8 @@ def _(mo):
 
     **Changes**
 
+    - 16 Oct: ② and ③ stop on their own after `MAX_HOURS` (11 h) and offer the session bundle; molab ends sessions at 12 h.
+    - 15 Oct: the setup picker also sits next to ② and ③.
     - 14 Oct: setups K to N (32 dates per year, 1600-epoch pretraining, tuning on val, Small encoder); faster GPU pretraining that resumes after a restart.
     - 12 Oct: setups F to J (test-time augmentation, spatial head, 400-epoch pretraining, self-training, Small encoder).
     - 12 Oct: pretraining on labelled-site images removed; E is the default.
@@ -159,6 +161,7 @@ def _(WORK):
               "F_tta": _F, "G_spatial": _G, "H_pre400": _H, "I_selftrain": _I, "J_small": _J,
               "K_bins32": _K, "L_pre1600": _L, "M_tune": _M, "N_small": _N}
     ST_CONF, TTA_DRAWS = 0.9, 4  # pseudo-label confidence, test-time date draws
+    MAX_HOURS = 11.0  # stop new work after this many hours; molab ends the session at 12 h
     TUNE = dict(FT=[dict(ld=ld, lr=m) for ld in (0.75, 0.9) for m in (1, 2)], SL=[dict(lr=m) for m in (0.5, 1, 2)])  # picked on val
     SETUP_LABELS = {"A_v1.1": "A · v1.1 settings", "B_overlap": "B · + overlapping tiles", "C_flips": "C · + flips and rotations",
                     "D_droppath": "D · + drop path", "E_lovasz": "E · + Lovász loss (all quick wins)",
@@ -176,6 +179,7 @@ def _(WORK):
         HF_DATASET_REPO,
         HF_REVISION,
         MASK_CLOUDY_TOKENS,
+        MAX_HOURS,
         MODEL,
         PATCH,
         PRE,
@@ -213,10 +217,10 @@ def _(mo, ui_folds, ui_ratios, ui_regimes, ui_seeds):
     return FOLDS, N_RUNS, RATIOS, REGIMES, SEEDS
 
 
-@app.cell
+@app.cell(hide_code=True)
 def _(SETUPS, SETUP_LABELS, mo):
     ui_setup = mo.ui.dropdown({SETUP_LABELS[k]: k for k in SETUPS}, value=SETUP_LABELS["E_lovasz"], label="setup")
-    mo.vstack([mo.md("**Setup.** Each one adds one change to the one above."), ui_setup])
+    mo.vstack([mo.md("**Setup (A to N).** Pick one before ② and ③."), ui_setup])
     return (ui_setup,)
 
 
@@ -253,11 +257,13 @@ def _(
     FUSED,
     BASE,
     MASK_CLOUDY_TOKENS,
+    MAX_HOURS,
     MODEL,
     PATCH,
     PRE,
     Path,
     SAVE_WEIGHTS,
+    SESSION_T0,
     ST_CONF,
     TTA_DRAWS,
     TUNE,
@@ -266,6 +272,7 @@ def _(
     WD,
     copy,
     h5py,
+    io,
     json,
     math,
     nn,
@@ -273,6 +280,7 @@ def _(
     pd,
     time,
     torch,
+    zipfile,
 ):
     YEARS = ["2023", "2024", "2025"]
     CLEAR_SCL = (4, 5, 6, 7)
@@ -282,6 +290,24 @@ def _(
                "small": dict(dim=384, depth=12, heads=6, dec_dim=256, dec_depth=4, dec_heads=8),
                "base": dict(dim=768, depth=12, heads=12, dec_dim=512, dec_depth=8, dec_heads=16)}
     STATE = {}  # norm stats and eval crops, filled by ①
+
+
+    class TimeUp(Exception):
+        pass
+
+
+    def hours_left():
+        return MAX_HOURS - (time.time() - SESSION_T0) / 3600
+
+
+    def zip_base(include):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            for p in sorted(BASE.rglob("*")):
+                rel = p.relative_to(BASE)
+                if p.is_file() and include(rel):
+                    z.write(p, rel.as_posix(), compress_type=zipfile.ZIP_STORED if p.suffix == ".pt" else zipfile.ZIP_DEFLATED)
+        return buf.getvalue()
 
 
     def make_bins(T, nb=BINS):
@@ -732,11 +758,14 @@ def _(
                 tot += loss.detach()
             hist.append(float(tot) / spe)
             print(f"  pretrain epoch {ep + 1:3d}/{P_['epochs']}  masked L1 {hist[-1]:.4f}  {(time.time() - t0) / 60:.1f} min")
-            if (ep + 1) % P_["save_every"] == 0 and ep + 1 < P_["epochs"]:
+            out_of_time = hours_left() <= 0 and ep + 1 < P_["epochs"]
+            if ((ep + 1) % P_["save_every"] == 0 and ep + 1 < P_["epochs"]) or out_of_time:
                 part.parent.mkdir(parents=True, exist_ok=True)
                 torch.save(dict(mae=mae.state_dict(), opt=opt.state_dict(), sch=sch.state_dict(), scaler=scaler.state_dict(), hist=hist, ep=ep + 1,
                                 rng=rng.bit_generator.state, torch_rng=torch.get_rng_state(), gen=gen.get_state(),
                                 cuda_rng=torch.cuda.get_rng_state() if DEVICE == "cuda" else None), part)
+            if out_of_time:
+                raise TimeUp(f"pretraining paused at epoch {ep + 1}/{P_['epochs']}")
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"encoder": mae.encoder.state_dict(), "model": model, "fold": fold, "history": hist, "epoch": P_["epochs"], "bins": bins,
                     "crop": CROP, "patch": PATCH, "pre": P_, "with_train_sites": False, "norm_stats": {k: v.ravel().tolist() for k, v in STATE["ST"].items()},
@@ -1086,15 +1115,18 @@ def _(
     return (
         IGNORE,
         STATE,
+        TimeUp,
         YEARS,
         ckpt_path,
         eval_crops,
+        hours_left,
         load_data,
         norm_stats,
         pretrain,
         run_one,
         summarize,
         train_units,
+        zip_base,
     )
 
 
@@ -1380,9 +1412,20 @@ def _(BASE, Path, io, mo, ui_restore, zipfile):
 
 
 @app.cell
-def _(mo):
+def _(MAX_HOURS, VERSION, mo, time, zip_base):
+    def time_up(msg):
+        _b = zip_base(lambda r: "weights" not in r.parts)
+        return mo.vstack([mo.md(f"**Stopped at the {MAX_HOURS:g} h limit:** {msg}. Download the session bundle now, "
+                                "then restore it in a new session and press the same button to continue."),
+                          mo.download(_b, filename=f"vicoffee_maestro_v{VERSION}_session_{time.strftime('%Y%m%d_%H%M')}.zip",
+                                      label=f"session bundle ({len(_b) / 2**20:.0f} MB)")])
+    return (time_up,)
+
+
+@app.cell(hide_code=True)
+def _(mo, ui_setup):
     run_pre = mo.ui.run_button(label="② Pretrain")
-    run_pre
+    mo.hstack([ui_setup, run_pre], justify="start")
     return (run_pre,)
 
 
@@ -1394,11 +1437,13 @@ def _(
     Path,
     REGIMES,
     S,
+    TimeUp,
     ckpt_path,
     mo,
     pretrain,
     restore_notes,
     run_pre,
+    time_up,
     torch,
 ):
     _need_enc = any(m in REGIMES for m in ("LP", "FT"))
@@ -1408,7 +1453,10 @@ def _(
     ENC_PATHS, HISTORIES = {}, {}
     if _need_enc:
         for _f in FOLDS:
-            ENC_PATHS[_f] = Path(PRETRAINED_ENCODER) if PRETRAINED_ENCODER else pretrain(D, _f, S["pre_epochs"], S["model"], S["bins"], S["fast_pre"])
+            try:
+                ENC_PATHS[_f] = Path(PRETRAINED_ENCODER) if PRETRAINED_ENCODER else pretrain(D, _f, S["pre_epochs"], S["model"], S["bins"], S["fast_pre"])
+            except TimeUp as _e:
+                mo.stop(True, time_up(str(_e)))
             _st = torch.load(ENC_PATHS[_f], map_location="cpu", weights_only=False)
             HISTORIES[ENC_PATHS[_f].name] = _st.get("history", [])
     mo.md("\n".join(f"- fold {f}: `{p.name}`" for f, p in ENC_PATHS.items()) or "*SL only: no encoder needed.*")
@@ -1451,10 +1499,10 @@ def _(FOLDS, N_RUNS, OUT, RATIOS, REGIMES, SEEDS, json, mo, np, restore_notes):
     return
 
 
-@app.cell
-def _(mo):
+@app.cell(hide_code=True)
+def _(mo, ui_setup):
     run_dn = mo.ui.run_button(label="③ Run downstream")
-    run_dn
+    mo.hstack([ui_setup, run_dn], justify="start")
     return (run_dn,)
 
 
@@ -1470,31 +1518,42 @@ def _(
     S,
     SEEDS,
     SESSION_T0,
+    TimeUp,
+    hours_left,
     mo,
     run_dn,
     run_one,
     summarize,
     time,
+    time_up,
 ):
     _paths = {(m, f, r, s): OUT / "runs" / f"{m}_f{f}_r{r}_s{s}.json" for f in FOLDS for r in RATIOS for s in SEEDS for m in REGIMES}
     DN_READY = all(p.exists() for p in _paths.values())
     mo.stop(not run_dn.value and not DN_READY,
             mo.md(f"*{sum(p.exists() for p in _paths.values())}/{N_RUNS} runs on disk. Press ③ to "
                   + ("resume.*" if any(p.exists() for p in _paths.values()) else "start.*")))
-    results = []
-    with mo.status.progress_bar(total=N_RUNS, title="downstream", remove_on_exit=False) as _bar:
-        for _f in FOLDS:
-            for _r in RATIOS:
-                for _s in SEEDS:
-                    for _m in REGIMES:
-                        _bar.update(increment=0, subtitle=f"{_m} · fold {_f} · ratio {_r} · seed {_s}")
-                        _res = run_one(D, _m, _f, _r, _s, ENC_PATHS.get(_f), S)
-                        results.append(_res)
-                        print(f"{_m} f{_f} r{_r} s{_s}: test mIoU {_res['test']['mIoU']:.4f}  IoU coffee {_res['test']['IoU_coffee']:.4f}"
-                              f"  | {_res['epochs_run']}/{_res['epochs_planned']} ep, best {_res['best_epoch']} | {_res['minutes']} min")
-                        _bar.update()
+    results, _stopped = [], None
+    try:
+        with mo.status.progress_bar(total=N_RUNS, title="downstream", remove_on_exit=False) as _bar:
+            for _f in FOLDS:
+                for _r in RATIOS:
+                    for _s in SEEDS:
+                        for _m in REGIMES:
+                            if hours_left() <= 0 and not _paths[(_m, _f, _r, _s)].exists():
+                                raise TimeUp(f"{len(results)} of {N_RUNS} runs on disk, the rest continue next session")
+                            _bar.update(increment=0, subtitle=f"{_m} · fold {_f} · ratio {_r} · seed {_s}")
+                            _res = run_one(D, _m, _f, _r, _s, ENC_PATHS.get(_f), S)
+                            results.append(_res)
+                            print(f"{_m} f{_f} r{_r} s{_s}: test mIoU {_res['test']['mIoU']:.4f}  IoU coffee {_res['test']['IoU_coffee']:.4f}"
+                                  f"  | {_res['epochs_run']}/{_res['epochs_planned']} ep, best {_res['best_epoch']} | {_res['minutes']} min")
+                            _bar.update()
+                summarize(results, OUT)
+    except TimeUp as _e:
+        _stopped = str(_e)
+        if results:
             summarize(results, OUT)
-    mo.md(f"**{len(results)} runs done** (setup {S['name']}). Total session time {(time.time() - SESSION_T0) / 3600:.1f} h.")
+    (time_up(_stopped) if _stopped else
+     mo.md(f"**{len(results)} runs done** (setup {S['name']}). Total session time {(time.time() - SESSION_T0) / 3600:.1f} h."))
     return (results,)
 
 
@@ -1629,22 +1688,10 @@ def _(mo):
 
 
 @app.cell
-def _(BASE, OUT, VERSION, io, mo, run_dl, time, zipfile):
+def _(OUT, VERSION, mo, run_dl, time, zip_base):
     mo.stop(not run_dl.value, mo.md("*Press **prepare downloads**.*"))
-
-
-    def _zip(include):
-        _buf = io.BytesIO()
-        with zipfile.ZipFile(_buf, "w") as _z:
-            for _p in sorted(BASE.rglob("*")):
-                _rel = _p.relative_to(BASE)
-                if _p.is_file() and include(_rel):
-                    _z.write(_p, _rel.as_posix(), compress_type=zipfile.ZIP_STORED if _p.suffix == ".pt" else zipfile.ZIP_DEFLATED)
-        return _buf.getvalue()
-
-
-    _bundle = _zip(lambda r: "weights" not in r.parts)
-    _weights = _zip(lambda r: "weights" in r.parts)
+    _bundle = zip_base(lambda r: "weights" not in r.parts)
+    _weights = zip_base(lambda r: "weights" in r.parts)
     _stamp = time.strftime("%Y%m%d_%H%M")
     mo.vstack([
         mo.download(_bundle, filename=f"vicoffee_maestro_v{VERSION}_session_{_stamp}.zip", label=f"session bundle ({len(_bundle) / 2**20:.0f} MB)"),
