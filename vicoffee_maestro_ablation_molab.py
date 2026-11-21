@@ -147,7 +147,7 @@ def _(WORK):
     _H = dict(_G, pre_epochs=400)
     # ablations: each setup changes exactly one thing vs H, never combined
     # masking ablations; MAESTRO original (S2 only): 25% whole dates + 25% tubes, random fill to the ratio, no date runs
-    _MASK = {k: dict(v, ratios=["0.1", "0.5"]) for k, v in {"Hm_maestro": dict(_H, mask_mix=(0.25, 0.25, 0)), "H15_mask": dict(_H, mask=0.15),
+    _MASK = {k: dict(v, ratios=["0.05", "1.0"]) for k, v in {"Hm_maestro": dict(_H, mask_mix=(0.25, 0.25, 0)), "H15_mask": dict(_H, mask=0.15),
                                                             "H30_mask": dict(_H, mask=0.3), "H60_mask": dict(_H, mask=0.6)}.items()}
     # loss ablations, H encoder; the loss replaces H's CE + 0.5 Lovász
     _LOSS = {f"HL_{k}": dict(_H, loss=k, ratios=["0.1"]) for k in ("ce", "wce", "dice", "dice_ce", "lovasz")}  # 10% labels only
